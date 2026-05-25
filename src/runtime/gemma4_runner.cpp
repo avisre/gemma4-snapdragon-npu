@@ -127,7 +127,152 @@ bool Gemma4Runner::Initialize(const Options&   opts,
         if (!ParseBinaryMetadata(i, opts_.context_binary_paths[i]))
             return false;
     }
+
+    if (!BuildRopeTensors()) return false;
     return true;
+}
+
+// ===========================================================================
+// RoPE injection
+// ===========================================================================
+// AI Hub's compiler dead-code-eliminated the rotary_emb Unsqueeze tensors from
+// part 0 (since part 0 owns layers 0..9 but does not itself need to apply
+// rotary embedding to its own outputs — those tensors are *intermediate*
+// values consumed by self-attention nodes that live in parts 1..3 for layers
+// 10..27, which is wrong; layer 0's RoPE is needed by layer 0 inside part 0).
+// Empirically, however, parts 1..3 still list the layer-0 sliding and layer-4
+// global rotary tensors as graph inputs. They were never produced upstream,
+// so the previous runner zero-filled them, corrupting attention.
+//
+// Here we compute the correct cos/sin tables on the host once, in fp16, and
+// later RunChainOnce binds them by name to any part that needs them.
+//
+// Math (must match transformers/models/gemma4/modeling_gemma4.py exactly):
+//   - sliding (layer 0): default RoPE, theta=10000, head_dim=256
+//       inv_freq[i] = 1 / 10000^(2i/256), i=0..127  (length 128)
+//       freqs[p,i]  = p * inv_freq[i],              shape [32,128]
+//       emb         = concat(freqs, freqs, axis=-1) shape [32,256]
+//       cos,sin     = cos(emb), sin(emb)            shape [32,256]
+//       Layout in QNN buffer: [1,32,256] fp16 row-major = 8192 elems.
+//
+//   - global (layer 4): proportional RoPE, theta=1e6, head_dim=512,
+//                       partial_rotary_factor=0.25
+//       rope_angles  = int(0.25 * 512 / 2) = 64
+//       inv_freq_rot[i] = 1 / 1e6^(2i/512), i=0..63 (length 64)
+//       nope_angles  = 256 - 64 = 192 zeros appended
+//       inv_freq     = concat(inv_freq_rot, zeros(192)) length 256
+//       freqs[p,i]   = p * inv_freq[i]              shape [32,256]
+//       emb          = concat(freqs, freqs, -1)     shape [32,512]
+//       cos,sin                                     shape [32,512]
+//       Layout in QNN buffer: [1,32,512] fp16 = 16384 elems.
+//
+// attention_scaling = 1.0 in both cases (verified from the ONNX Constant_4).
+// ===========================================================================
+static inline uint16_t FloatToHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t frac = x & 0x7FFFFFu;
+    if (exp <= 0) {
+        // subnormal or zero
+        if (exp < -10) return (uint16_t)sign;
+        frac = (frac | 0x800000u) >> (1 - exp);
+        // round to nearest
+        if (frac & 0x1000u) frac += 0x2000u;
+        return (uint16_t)(sign | (frac >> 13));
+    } else if (exp >= 31) {
+        // inf or nan
+        return (uint16_t)(sign | 0x7C00u | (frac ? 0x200u : 0u));
+    }
+    // round to nearest
+    if (frac & 0x1000u) {
+        frac += 0x2000u;
+        if (frac & 0x800000u) { frac = 0; exp += 1; if (exp >= 31) return (uint16_t)(sign | 0x7C00u); }
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (frac >> 13));
+}
+
+bool Gemma4Runner::BuildRopeTensors() {
+    auto build = [&](const std::string& name_cos,
+                     const std::string& name_sin,
+                     double base,
+                     int head_dim,
+                     double partial_rotary_factor) -> void {
+        const int seq = kPrefillSeq;
+        const int rope_angles = (int)(partial_rotary_factor * head_dim / 2.0);  // 128 sliding, 64 global
+        const int half_dim    = head_dim / 2;                                   // 128, 256
+        const int full_dim    = head_dim;                                       // 256, 512
+
+        std::vector<double> inv_freq(half_dim, 0.0);
+        for (int i = 0; i < rope_angles; ++i) {
+            // exponent uses head_dim, not 2*rope_angles (per modeling_rope_utils.py:238)
+            inv_freq[i] = 1.0 / std::pow(base, (double)(2 * i) / (double)head_dim);
+        }
+        // remaining (half_dim - rope_angles) entries stay 0 (nope_angles).
+
+        std::vector<uint8_t>& cos_buf = rope_buffers_[name_cos];
+        std::vector<uint8_t>& sin_buf = rope_buffers_[name_sin];
+        cos_buf.assign((size_t)seq * full_dim * 2, 0);
+        sin_buf.assign((size_t)seq * full_dim * 2, 0);
+        auto* cos_p = reinterpret_cast<uint16_t*>(cos_buf.data());
+        auto* sin_p = reinterpret_cast<uint16_t*>(sin_buf.data());
+
+        for (int p = 0; p < seq; ++p) {
+            for (int i = 0; i < half_dim; ++i) {
+                const double angle = (double)p * inv_freq[i];
+                const float c = (float)std::cos(angle);
+                const float s = (float)std::sin(angle);
+                // emb = concat(freqs, freqs, -1) -> position i and i+half_dim
+                // share the same angle.
+                const size_t off0 = (size_t)p * full_dim + i;
+                const size_t off1 = (size_t)p * full_dim + (i + half_dim);
+                cos_p[off0] = FloatToHalf(c);
+                cos_p[off1] = FloatToHalf(c);
+                sin_p[off0] = FloatToHalf(s);
+                sin_p[off1] = FloatToHalf(s);
+            }
+        }
+        LOGI("RoPE built: '%s' (cos, %zu bytes), '%s' (sin, %zu bytes), "
+             "base=%g head_dim=%d partial=%.2f",
+             name_cos.c_str(), cos_buf.size(),
+             name_sin.c_str(), sin_buf.size(),
+             base, head_dim, partial_rotary_factor);
+    };
+
+    // Layer 0 (sliding_attention): default RoPE
+    build("_text_model_layers_0_self_attn_Unsqueeze_output_0",     // cos
+          "_text_model_layers_0_self_attn_Unsqueeze_1_output_0",   // sin
+          /*base*/10000.0, /*head_dim*/256, /*partial*/1.0);
+
+    // Layer 4 (full_attention): proportional RoPE
+    build("_text_model_layers_4_self_attn_Unsqueeze_output_0",     // cos
+          "_text_model_layers_4_self_attn_Unsqueeze_1_output_0",   // sin
+          /*base*/1000000.0, /*head_dim*/512, /*partial*/0.25);
+
+    // Allocate the causal-mask buffer (filled per-RunChainOnce because it
+    // depends on num_real_tokens / padding). Key matches the QNN input name
+    // that part 2 (and via forwarding, part 3) expect.
+    rope_buffers_["_text_model_layers_19_self_attn_Cast_9_output_0"]
+        .assign((size_t)kPrefillSeq * kPrefillSeq * 2, 0);
+    return true;
+}
+
+// Compute [seq, seq] fp16 causal+padding mask:
+//   mask[q,k] = 0.0   if k <= q AND input_ids[k] != PAD(0)
+//             = -65504.0  otherwise (fp16 min, matches the ONNX Constant_11)
+static void FillCausalMaskFp16(uint16_t* dst,
+                               const int32_t* seq_ids,
+                               int seq) {
+    constexpr uint16_t kAllowed = 0x0000u;   // +0.0 fp16
+    constexpr uint16_t kMasked  = 0xFBFFu;   // -65504.0 fp16 (largest negative normal)
+    for (int q = 0; q < seq; ++q) {
+        for (int k = 0; k < seq; ++k) {
+            const bool causal_ok = (k <= q);
+            const bool key_real  = (seq_ids[k] != 0);
+            dst[q * seq + k] = (causal_ok && key_real) ? kAllowed : kMasked;
+        }
+    }
 }
 
 void Gemma4Runner::ResetState() {}
@@ -416,6 +561,15 @@ void Gemma4Runner::FreeContext(int part_idx) {
 // ===========================================================================
 const uint16_t* Gemma4Runner::RunChainOnce(const int32_t* seq_ids) {
     LOGI("=== RunChainOnce start ===");
+    // Refresh the causal+padding mask for this prefill window.
+    {
+        auto it = rope_buffers_.find(
+            "_text_model_layers_19_self_attn_Cast_9_output_0");
+        if (it != rope_buffers_.end()) {
+            FillCausalMaskFp16(reinterpret_cast<uint16_t*>(it->second.data()),
+                               seq_ids, kPrefillSeq);
+        }
+    }
     // -- Run PLE on host: per_layer_inputs[1,32,35,256] fp16.
     // Determine the size: kPrefillSeq * kPleNumLayers * kPleDim * 2 bytes.
     // Stash directly into part0's per_layer_inputs input buffer (lookup by
@@ -501,73 +655,173 @@ const uint16_t* Gemma4Runner::RunChainOnce(const int32_t* seq_ids) {
             return nullptr;
         }
 
-        // Propagate outputs to next part's inputs by NAME first (AI Hub
-        // sometimes preserves the original ONNX names for cross-part
-        // edges), then by shape as a fallback.
+        // Propagate outputs to next part's inputs. Strategy (in order):
+        //   1. Explicit semantic mapping: parts 1/2/3 emit renamed outputs
+        //      (output_0/output_1/...). We know what each *should* be from
+        //      the source ONNX, so we hard-map them to the canonical names
+        //      that downstream parts expect.
+        //   2. Exact name match.
+        //   3. Upstream search by name (for tensors that pass through
+        //      multiple parts unchanged, e.g. per_layer_inputs).
+        //   4. Host-computed RoPE injection.
+        //   5. Shape-match fallback (warn — this is fuzzy).
         if (p + 1 < kNumParts) {
             auto* next = part_info_[p + 1].get();
             std::vector<bool> consumed_in(next->inputs.size(), false);
-            // Pass 1: name-exact match.
-            for (auto& out_td : pi->outputs) {
-                if (out_td.name.empty()) continue;
+
+            auto copy_into = [&](size_t k, const void* src, size_t bytes) {
+                auto& in_td = next->inputs[k];
+                const size_t need_bytes = in_td.total_elems * in_td.elem_bytes;
+                std::memcpy(in_td.host_buf, src,
+                            bytes < need_bytes ? bytes : need_bytes);
+                consumed_in[k] = true;
+            };
+            auto find_next_input = [&](const std::string& want) -> int {
                 for (size_t k = 0; k < next->inputs.size(); ++k) {
                     if (consumed_in[k]) continue;
-                    auto& in_td = next->inputs[k];
-                    if (in_td.name == out_td.name &&
-                        in_td.total_elems * in_td.elem_bytes ==
-                        out_td.total_elems * out_td.elem_bytes) {
-                        std::memcpy(in_td.host_buf, out_td.host_buf,
-                                    in_td.total_elems * in_td.elem_bytes);
-                        consumed_in[k] = true;
-                        break;
-                    }
+                    if (next->inputs[k].name == want) return (int)k;
+                }
+                return -1;
+            };
+            auto find_out_by_name = [&](const std::string& want) -> const TensorDesc* {
+                for (auto& o : pi->outputs) if (o.name == want) return &o;
+                return nullptr;
+            };
+            auto find_out_by_shape = [&](size_t elems, size_t bytes_per) -> const TensorDesc* {
+                for (auto& o : pi->outputs) {
+                    if (o.total_elems == elems && o.elem_bytes == bytes_per) return &o;
+                }
+                return nullptr;
+            };
+
+            // ---------------- (1) explicit semantic mapping ----------------
+            // The 5-part split owns layers as: p0=[0..9], p1=[10..19],
+            // p2=[20..27], p3=[28..34], p4=lm_head only. Each non-final part
+            // emits the residual hidden state of its LAST layer (Mul_1) and,
+            // for the KV-shared boundary layers (19 and 24), the K/V Casts.
+            // Names are documented in exported_onnx_sha_split5/part{N}.onnx.
+            struct Edge { const char* qnn_out; const char* canonical; };
+            // From -> {QNN renamed output name on producer, canonical ONNX name}.
+            // We use the canonical name on the consumer side.
+            static const std::vector<std::vector<Edge>> kEdges = {
+                // part 0 -> downstream  (output_0=hidden 49152, output_1=per_layer 286720)
+                { {"output_0", "_text_model_layers_9_Mul_1_output_0"},
+                  {"output_1", "_text_model_Mul_1_output_0"} },
+                // part 1 -> downstream  (output_0=49152 hidden_19, output_1=16384 Cast,
+                //                        output_2=16384 Cast_1; Cast_9 was dropped)
+                { {"output_0", "_text_model_layers_19_Mul_1_output_0"},
+                  {"output_1", "_text_model_layers_19_self_attn_Cast_output_0"},
+                  {"output_2", "_text_model_layers_19_self_attn_Cast_1_output_0"} },
+                // part 2 -> downstream  (output_0=49152 hidden_27, output_1=16384,
+                //                        output_2=16384, output_3=1024)
+                { {"output_0", "_text_model_layers_27_Mul_1_output_0"},
+                  {"output_1", "_text_model_layers_24_self_attn_Cast_output_0"},
+                  {"output_2", "_text_model_layers_24_self_attn_Cast_1_output_0"},
+                  {"output_3", "_text_model_layers_24_self_attn_Cast_9_output_0"} },
+                // part 3 -> part 4   (output_0 = norm output)
+                { {"output_0", "_text_model_norm_Cast_output_0"} },
+            };
+            const auto& edges = kEdges[p];
+            for (const auto& e : edges) {
+                const TensorDesc* out = find_out_by_name(e.qnn_out);
+                if (!out) continue;
+                int k = find_next_input(e.canonical);
+                if (k < 0) continue;  // downstream doesn't need it
+                copy_into((size_t)k, out->host_buf,
+                          out->total_elems * out->elem_bytes);
+            }
+
+            // ---------------- (2) exact name match -------------------------
+            for (auto& out_td : pi->outputs) {
+                if (out_td.name.empty()) continue;
+                int k = find_next_input(out_td.name);
+                if (k < 0) continue;
+                auto& in_td = next->inputs[k];
+                if (in_td.total_elems == out_td.total_elems &&
+                    in_td.elem_bytes  == out_td.elem_bytes) {
+                    copy_into((size_t)k, out_td.host_buf,
+                              out_td.total_elems * out_td.elem_bytes);
                 }
             }
-            // Pass 2: shape match for the rest.
+
+            // ---------------- (3) upstream search by name ------------------
+            for (size_t k = 0; k < next->inputs.size(); ++k) {
+                if (consumed_in[k]) continue;
+                auto& need = next->inputs[k];
+                const TensorDesc* src = nullptr;
+                for (int q = p; q >= 0 && !src; --q) {
+                    for (auto& td : part_info_[q]->inputs) {
+                        if (td.name == need.name &&
+                            td.total_elems == need.total_elems &&
+                            td.elem_bytes  == need.elem_bytes) { src = &td; break; }
+                    }
+                    if (src) break;
+                    for (auto& td : part_info_[q]->outputs) {
+                        if (td.name == need.name &&
+                            td.total_elems == need.total_elems &&
+                            td.elem_bytes  == need.elem_bytes) { src = &td; break; }
+                    }
+                }
+                if (src) copy_into(k, src->host_buf,
+                                   src->total_elems * src->elem_bytes);
+            }
+
+            // ---------------- (4) host-computed RoPE injection -------------
+            for (size_t k = 0; k < next->inputs.size(); ++k) {
+                if (consumed_in[k]) continue;
+                auto& need = next->inputs[k];
+                auto it = rope_buffers_.find(need.name);
+                if (it == rope_buffers_.end()) continue;
+                if (it->second.size() != need.total_elems * need.elem_bytes) {
+                    LOGE("RoPE size mismatch for %s: have %zu need %zu",
+                         need.name.c_str(), it->second.size(),
+                         need.total_elems * need.elem_bytes);
+                    continue;
+                }
+                copy_into(k, it->second.data(), it->second.size());
+                LOGI("[part %d->%d] injected host RoPE '%s' (%zu bytes)",
+                     p, p+1, need.name.c_str(), it->second.size());
+            }
+
+            // ---------------- (5) shape fallback ---------------------------
+            // Only used for tensors we still can't identify. Warns to log.
             for (auto& out_td : pi->outputs) {
-                int matched = -1;
+                // skip outputs already used by semantic mapping; the
+                // simplest check is by name.
+                bool was_mapped = false;
+                for (const auto& e : edges) {
+                    if (out_td.name == e.qnn_out) { was_mapped = true; break; }
+                }
+                if (was_mapped) continue;
+                const TensorDesc* match_in = nullptr;
+                int matched_k = -1;
                 for (size_t k = 0; k < next->inputs.size(); ++k) {
                     if (consumed_in[k]) continue;
                     auto& in_td = next->inputs[k];
                     if (in_td.total_elems == out_td.total_elems &&
                         in_td.elem_bytes  == out_td.elem_bytes) {
-                        matched = (int)k; break;
+                        match_in = &in_td; matched_k = (int)k; break;
                     }
                 }
-                if (matched >= 0) {
-                    auto& in_td = next->inputs[matched];
-                    const size_t bytes = in_td.total_elems * in_td.elem_bytes;
-                    std::memcpy(in_td.host_buf, out_td.host_buf, bytes);
-                    consumed_in[matched] = true;
+                if (match_in && matched_k >= 0) {
+                    copy_into((size_t)matched_k, out_td.host_buf,
+                              out_td.total_elems * out_td.elem_bytes);
+                    LOGI("[part %d->%d] fuzzy shape-map '%s' -> '%s' (%zu elems)",
+                         p, p+1, out_td.name.c_str(),
+                         match_in->name.c_str(), out_td.total_elems);
                 }
             }
-            // For inputs that still didn't match (e.g. attention scratch
-            // tensors that part0 dropped but part_N+1 still needs), look
-            // them up by NAME in *upstream* parts' outputs/inputs and
-            // forward those.
+
+            // Final report of un-matched inputs (zero-filled).
             for (size_t k = 0; k < next->inputs.size(); ++k) {
-                if (consumed_in[k]) continue;
-                auto& need = next->inputs[k];
-                // Search upstream parts q < p+1 for a same-name tensor.
-                const TensorDesc* src = nullptr;
-                for (int q = p; q >= 0 && !src; --q) {
-                    for (auto& td : part_info_[q]->inputs)
-                        if (td.name == need.name &&
-                            td.total_elems == need.total_elems &&
-                            td.elem_bytes  == need.elem_bytes) { src = &td; break; }
-                    if (src) break;
-                    for (auto& td : part_info_[q]->outputs)
-                        if (td.name == need.name &&
-                            td.total_elems == need.total_elems &&
-                            td.elem_bytes  == need.elem_bytes) { src = &td; break; }
-                }
-                if (src) {
-                    std::memcpy(need.host_buf, src->host_buf,
-                                need.total_elems * need.elem_bytes);
-                    consumed_in[k] = true;
+                if (consumed_in[k]) {
+                    LOGI("[part %d->%d] bound '%s' (%zu elems)",
+                         p, p+1, next->inputs[k].name.c_str(),
+                         next->inputs[k].total_elems);
                 } else {
-                    LOGI("[part %d->%d] input '%s' (elems=%zu) un-matched, zero",
-                         p, p+1, need.name.c_str(), need.total_elems);
+                    LOGE("[part %d->%d] UN-MATCHED '%s' (elems=%zu) -> zeros",
+                         p, p+1, next->inputs[k].name.c_str(),
+                         next->inputs[k].total_elems);
                 }
             }
         }

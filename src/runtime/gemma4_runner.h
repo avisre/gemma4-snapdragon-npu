@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // QNN handle aliases (opaque to the header).
@@ -173,6 +174,15 @@ private:
     std::vector<std::unique_ptr<PartInfo>> part_info_;  // kNumParts
     // Per-part on-disk blob (the .bin path); loaded lazily during execute.
     std::vector<std::string> part_blob_paths_;
+
+    // Host-computed RoPE tensors. AI Hub's compiler dead-code-eliminated the
+    // RoPE Unsqueeze outputs from part 0 (since part 0 doesn't consume them,
+    // only parts 1+ do). We compute them on the host and inject by name into
+    // any downstream part that needs them.
+    //   key = QNN-side tensor name (e.g. "_text_model_layers_0_self_attn_Unsqueeze_output_0")
+    //   value = fp16 buffer, layout matches QNN's expected total_elems
+    std::unordered_map<std::string, std::vector<uint8_t>> rope_buffers_;
+    bool BuildRopeTensors();
 
     // Host backing buffers for inter-part data flow (sized for prefill).
     // We allocate one shared set, sized to the max each tensor needs.
