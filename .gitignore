@@ -1,0 +1,46 @@
+# Build artifacts
+*.o
+*.so.bak
+*.bak
+__pycache__/
+*.pyc
+build-*/
+cmake-out*/
+
+# Large model artifacts (download/build separately - they're GB-scale)
+*.bin
+*.pte
+*.ple
+*.onnx
+*.onnx.data
+*.zip
+*.safetensors
+
+# Checkpoint dirs
+checkpoints/
+exported_onnx*/
+artifacts/
+aihub/
+litert/
+
+# Generated test outputs
+tmp_qaihub/
+phone_logs/
+ref_outputs/
+*.log
+
+# Environment
+venv/
+.venv/
+.env
+qnn_sdk/
+qnn_runtime/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

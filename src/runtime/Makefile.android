@@ -1,0 +1,39 @@
+# runtime/Makefile.android -- standalone Android arm64 build of the
+# gemma4_runner probe binary. Builds against QNN SDK 2.37 headers + libs.
+#
+# Why a separate Makefile (vs the existing one): the existing Makefile builds
+# two .a static libs and requires a SentencePiece arm64 build. This Makefile
+# produces a single executable that exercises the QNN load path, which is
+# what we need to verify the deploy on the OnePlus 10 Pro.
+
+NDK       ?= /home/hardoker77/Android/Sdk/ndk/28.2.13676358
+QNN       ?= /home/hardoker77/qnn_sdk/qairt/2.37.0.250724
+API       ?= 30
+TOOLCHAIN := $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
+CXX       := $(TOOLCHAIN)/bin/aarch64-linux-android$(API)-clang++
+
+CXXFLAGS  := -std=c++17 -O2 -fPIC -Wall -Wextra -Wno-unused-parameter \
+             -I. \
+             -I$(QNN)/include/QNN \
+             -I$(QNN)/include/QNN/HTP \
+             -I$(QNN)/include/QNN/System
+
+LDFLAGS   := -L$(QNN)/lib/aarch64-android \
+             -llog -ldl -static-libstdc++ \
+             -Wl,--gc-sections
+
+SRCS ?= gemma4_main.cpp gemma4_runner.cpp ple_preprocess.cpp
+OBJS := $(SRCS:.cpp=.o)
+
+.PHONY: all clean
+
+all: gemma4_runner
+
+gemma4_runner: $(OBJS)
+	$(CXX) -o $@ $(OBJS) $(LDFLAGS)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJS) gemma4_runner
