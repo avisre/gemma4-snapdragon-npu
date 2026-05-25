@@ -1,0 +1,72 @@
+[
+  {
+    "mode": "prefill",
+    "part": 0,
+    "job_id": "jgoe0el4p",
+    "name": "gemma4_hybrid_prefill_0",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jgoe0el4p/"
+  },
+  {
+    "mode": "prefill",
+    "part": 1,
+    "job_id": "j57vwv8r5",
+    "name": "gemma4_hybrid_prefill_1",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/j57vwv8r5/"
+  },
+  {
+    "mode": "prefill",
+    "part": 2,
+    "job_id": "jpyvwv97p",
+    "name": "gemma4_hybrid_prefill_2",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jpyvwv97p/"
+  },
+  {
+    "mode": "prefill",
+    "part": 3,
+    "job_id": "jp236364g",
+    "name": "gemma4_hybrid_prefill_3",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jp236364g/"
+  },
+  {
+    "mode": "prefill",
+    "part": 4,
+    "job_id": "j5mv24695",
+    "name": "gemma4_hybrid_prefill_4",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/j5mv24695/"
+  },
+  {
+    "mode": "decode",
+    "part": 0,
+    "job_id": "j56qjv8vg",
+    "name": "gemma4_hybrid_decode_0",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/j56qjv8vg/"
+  },
+  {
+    "mode": "decode",
+    "part": 1,
+    "job_id": "jglezomjp",
+    "name": "gemma4_hybrid_decode_1",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jglezomjp/"
+  },
+  {
+    "mode": "decode",
+    "part": 2,
+    "job_id": "jpe418kv5",
+    "name": "gemma4_hybrid_decode_2",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jpe418kv5/"
+  },
+  {
+    "mode": "decode",
+    "part": 3,
+    "job_id": "jpxej3e85",
+    "name": "gemma4_hybrid_decode_3",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jpxej3e85/"
+  },
+  {
+    "mode": "decode",
+    "part": 4,
+    "job_id": "jgd79806g",
+    "name": "gemma4_hybrid_decode_4",
+    "url": "https://workbench.aihub.qualcomm.com/jobs/jgd79806g/"
+  }
+]
