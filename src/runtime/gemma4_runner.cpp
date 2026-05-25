@@ -21,6 +21,7 @@
 #include "System/QnnSystemContext.h"
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpGraph.h"
+#include "HTP/QnnHtpContext.h"
 
 #include <dlfcn.h>
 #include <cmath>
@@ -89,7 +90,9 @@ Gemma4Runner::Gemma4Runner()
 }
 
 Gemma4Runner::~Gemma4Runner() {
-    for (int i = 0; i < kNumParts; ++i) {
+    // Free contexts in REVERSE order: parts 1..N referenced contexts_[0] as
+    // their group's first handle, so the head must be freed last.
+    for (int i = kNumParts - 1; i >= 0; --i) {
         if (contexts_[i] && qnn_fns_->v.contextFree)
             qnn_fns_->v.contextFree(contexts_[i], nullptr);
     }
@@ -114,21 +117,97 @@ bool Gemma4Runner::Initialize(const Options&   opts,
     if (!LoadSystem())  return false;
     if (!CreateDevice()) return false;
 
-    // Each part's full QNN context is ~1-1.5 GB of weights on HTP. The
-    // Hexagon PD has a fixed memory budget that cannot hold all five at
-    // once (~5 GB total). We therefore parse the binary metadata up-front
-    // (cheap — just tensor descriptors) and LAZILY create the context
-    // during execute, freeing it before moving on to the next part.
-    //
-    // ParseBinaryMetadata fills part_info_[i] without calling
-    // contextCreateFromBinary; CreateContextFromBinary in the execute
-    // loop does the heavy lift one part at a time.
+    // Parse metadata up-front (cheap — just tensor descriptors).
     for (int i = 0; i < kNumParts; ++i) {
         if (!ParseBinaryMetadata(i, opts_.context_binary_paths[i]))
             return false;
     }
 
+    // KEEP-RESIDENT REFACTOR (was: load-execute-free per part per token).
+    // Old path was 5×(read .bin + contextCreateFromBinary + execute + contextFree)
+    // per generated token — ~11s per part, ~55s per token.
+    //
+    // New path: try to create as many of the 5 contexts as HTP PD memory
+    // allows, ONCE here. With HTP weight sharing
+    // (QNN_HTP_CONTEXT_CONFIG_OPTION_WEIGHT_SHARING_ENABLED) + group
+    // registration enabled. Parts that fit stay RESIDENT (per-token cost =
+    // graphExecute only). Parts that don't fit fall back to the legacy
+    // load-execute-free path in RunChainOnce.
+    //
+    // FP16 5-part total is ~5.7 GB — typical HTP PD budget on SD8G1 v69
+    // is ~2 GB so we expect ~1-2 parts resident, rest swapped.
+    // INT8 (~2.5 GB total) should mostly fit; with weight sharing all 5
+    // may fit.
+    // Measure each part's on-disk size and the budget.
+    std::vector<std::pair<long, int>> by_size;
+    long total_bytes = 0;
+    long largest_bytes = 0;
+    for (int i = 0; i < kNumParts; ++i) {
+        FILE* f = fopen(opts_.context_binary_paths[i].c_str(), "rb");
+        long sz = 0;
+        if (f) { fseek(f, 0, SEEK_END); sz = ftell(f); fclose(f); }
+        by_size.push_back({sz, i});
+        total_bytes += sz;
+        if (sz > largest_bytes) largest_bytes = sz;
+    }
+    std::sort(by_size.begin(), by_size.end());  // smallest first
+    LOGI("Init: total %ld MB across %d parts; largest part %ld MB",
+         total_bytes >> 20, kNumParts, largest_bytes >> 20);
+
+    // Empirically the HTP v69 PD on SD8G1 caps around ~1.5-1.6 GB. Strategy:
+    //   - If total fits in ~1.4 GB: all resident (ideal — quant case).
+    //   - Else if no two parts fit together: skip resident loading entirely
+    //     (fall back to per-token swap; same as legacy path).
+    //   - Else: greedily fill with smallest parts, leaving headroom for the
+    //     largest swap load.
+    constexpr long kPdBudgetBytes  = 1500L << 20;  // 1.5 GB
+    constexpr long kHeadroomBytes  = 64L  << 20;   // 64 MB I/O scratch
+
+    int resident = 0;
+    long resident_bytes = 0;
+    if (total_bytes + kHeadroomBytes <= kPdBudgetBytes) {
+        // Try ALL resident.
+        for (auto& p : by_size) {
+            if (!CreateContextFromBinary(p.second) ||
+                !RetrieveGraphHandlesForPart(p.second)) {
+                LOGI("Init: all-resident failed at part %d, "
+                     "falling back to swap-only", p.second);
+                // Tear down anything we got so swap path stays consistent.
+                for (int j = 0; j < kNumParts; ++j) FreeContext(j);
+                resident = 0;
+                resident_bytes = 0;
+                break;
+            }
+            resident_bytes += p.first;
+            resident++;
+            LOGI("Init: part %d (%ld MB) RESIDENT", p.second, p.first >> 20);
+        }
+    } else if (largest_bytes + kHeadroomBytes > kPdBudgetBytes) {
+        // The biggest part alone (~1.5 GB FP16) eats the whole PD budget —
+        // we can't keep anything resident AND swap-load it. Use legacy
+        // swap-only path (= load-execute-free per part per token).
+        LOGI("Init: largest part >= PD budget; using legacy swap-only path");
+    } else {
+        // Try greedy small-first fill, leaving headroom for the largest part
+        // to swap-load on top.
+        for (auto& p : by_size) {
+            if (resident_bytes + p.first + largest_bytes + kHeadroomBytes
+                > kPdBudgetBytes) continue;
+            if (!CreateContextFromBinary(p.second) ||
+                !RetrieveGraphHandlesForPart(p.second)) {
+                FreeContext(p.second);
+                continue;
+            }
+            resident_bytes += p.first;
+            resident++;
+            LOGI("Init: part %d (%ld MB) RESIDENT",
+                 p.second, p.first >> 20);
+        }
+    }
+
     if (!BuildRopeTensors()) return false;
+    LOGI("Init: %d/%d contexts resident (%ld MB); %d swap per-token",
+         resident, kNumParts, resident_bytes >> 20, kNumParts - resident);
     return true;
 }
 
@@ -536,14 +615,36 @@ bool Gemma4Runner::CreateContextFromBinary(int part_idx) {
     RETURN_IF(fread(blob.data(), 1, sz, f) != (size_t)sz, "read failed (lazy)");
     fclose(f);
     LOGI("part %d: loading context (%ld bytes) onto HTP", part_idx, sz);
+
+    // HTP custom config: enable weight sharing. The multi-context group
+    // registration option (REGISTER_MULTI_CONTEXTS) is documented only for
+    // createFromBinaryListAsync; plain createFromBinary rejects it
+    // (QNN_CONTEXT_ERROR_INVALID_CONFIG = 0x1392). Weight sharing alone is
+    // a pure hint and safe to pass.
+    QnnHtpContext_CustomConfig_t htp_ws{};
+    htp_ws.option = QNN_HTP_CONTEXT_CONFIG_OPTION_WEIGHT_SHARING_ENABLED;
+    htp_ws.weightSharingEnabled = true;
+    QnnContext_Config_t cfg_ws{};
+    cfg_ws.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+    cfg_ws.customConfig = &htp_ws;
+    const QnnContext_Config_t* cfgs[] = { &cfg_ws, nullptr };
+
     Qnn_ErrorHandle_t err = qnn_fns_->v.contextCreateFromBinary(
-        backend_, device_, nullptr,
+        backend_, device_, cfgs,
         blob.data(), blob.size(),
         &contexts_[part_idx], nullptr);
     if (err != QNN_SUCCESS) {
-        LOGE("part %d: contextCreateFromBinary err=0x%llx", part_idx,
-             (unsigned long long)err);
-        return false;
+        LOGE("part %d: contextCreateFromBinary with WS err=0x%llx; "
+             "retrying without configs", part_idx, (unsigned long long)err);
+        err = qnn_fns_->v.contextCreateFromBinary(
+            backend_, device_, nullptr,
+            blob.data(), blob.size(),
+            &contexts_[part_idx], nullptr);
+        if (err != QNN_SUCCESS) {
+            LOGE("part %d: contextCreateFromBinary plain err=0x%llx", part_idx,
+                 (unsigned long long)err);
+            return false;
+        }
     }
     return true;
 }
@@ -628,13 +729,21 @@ const uint16_t* Gemma4Runner::RunChainOnce(const int32_t* seq_ids) {
         }
     }
 
-    // Execute each part. We lazily load + free each part's context to fit
-    // within the Hexagon PD memory budget (it can't hold all 5 GB of
-    // weights at once).
+    // Execute each part. Resident parts skip context (re)load; non-resident
+    // parts use the legacy swap path (create -> execute -> free).
     for (int p = 0; p < kNumParts; ++p) {
         auto* pi = part_info_[p].get();
-        if (!CreateContextFromBinary(p))   { return nullptr; }
-        if (!RetrieveGraphHandlesForPart(p)) { FreeContext(p); return nullptr; }
+        const bool was_resident = (contexts_[p] != nullptr && graphs_[p] != nullptr);
+        if (!was_resident) {
+            if (!CreateContextFromBinary(p)) {
+                LOGE("part %d: swap-load failed", p);
+                return nullptr;
+            }
+            if (!RetrieveGraphHandlesForPart(p)) {
+                FreeContext(p);
+                return nullptr;
+            }
+        }
 
         // Build flat Qnn_Tensor_t arrays.
         std::vector<Qnn_Tensor_t> in_ts, out_ts;
@@ -651,7 +760,7 @@ const uint16_t* Gemma4Runner::RunChainOnce(const int32_t* seq_ids) {
         if (err != QNN_SUCCESS) {
             LOGE("graphExecute(part %d) failed: 0x%llx", p,
                  (unsigned long long)err);
-            FreeContext(p);
+            if (!was_resident) FreeContext(p);
             return nullptr;
         }
 
@@ -825,8 +934,9 @@ const uint16_t* Gemma4Runner::RunChainOnce(const int32_t* seq_ids) {
                 }
             }
         }
-        // Free this part's HTP context (PD memory budget).
-        FreeContext(p);
+        // KEEP-RESIDENT: if loaded in Init, leave it. If we swap-loaded
+        // it for this token only, free now to reclaim PD RAM.
+        if (!was_resident) FreeContext(p);
     }
 
     // Last part: locate the logits tensor. AI Hub may rename "logits" to
