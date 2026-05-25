@@ -1,0 +1,140 @@
+{
+  "in_progress": true,
+  "results": [
+    {
+      "idx": 0,
+      "prompt": "Capital of France?",
+      "category": "factual",
+      "max_tokens_requested": 10,
+      "tokens_generated": 10,
+      "token_ids": [
+        64753,
+        529,
+        7001,
+        236881,
+        64753,
+        529,
+        7001,
+        236881,
+        64753,
+        529
+      ],
+      "first_token_id": 64753,
+      "first_token_text": "Capital",
+      "all_tokens_text": "Capital of France?Capital of France?Capital of",
+      "total_s": 148.073,
+      "tok_s": 0.0675,
+      "first_tok_latency_s": null,
+      "verdict": "coherent"
+    },
+    {
+      "idx": 1,
+      "prompt": "2+2=",
+      "category": "math",
+      "max_tokens_requested": 10,
+      "tokens_generated": 10,
+      "token_ids": [
+        236778,
+        236784,
+        236778,
+        236784,
+        236778,
+        236784,
+        236778,
+        236784,
+        236778,
+        236784
+      ],
+      "first_token_id": 236778,
+      "first_token_text": "2",
+      "all_tokens_text": "2=2=2=2=2=",
+      "total_s": 176.413,
+      "tok_s": 0.0567,
+      "first_tok_latency_s": null,
+      "verdict": "coherent"
+    },
+    {
+      "idx": 2,
+      "prompt": "Sun rises in",
+      "category": "completion",
+      "max_tokens_requested": 10,
+      "tokens_generated": 10,
+      "token_ids": [
+        18318,
+        33358,
+        528,
+        18318,
+        107,
+        1,
+        100,
+        100,
+        100,
+        100
+      ],
+      "first_token_id": 18318,
+      "first_token_text": "Sun",
+      "all_tokens_text": "Sun rises inSun\n<eos><|channel><|channel><|channel><|channel>",
+      "total_s": 178.192,
+      "tok_s": 0.0561,
+      "first_tok_latency_s": null,
+      "verdict": "coherent"
+    },
+    {
+      "idx": 3,
+      "prompt": "Python prints",
+      "category": "code",
+      "max_tokens_requested": 3,
+      "tokens_generated": 3,
+      "token_ids": [
+        32651,
+        24482,
+        32651
+      ],
+      "first_token_id": 32651,
+      "first_token_text": "Python",
+      "all_tokens_text": "Python printsPython",
+      "total_s": 66.915,
+      "tok_s": 0.0448,
+      "first_tok_latency_s": null,
+      "verdict": "coherent"
+    },
+    {
+      "idx": 4,
+      "prompt": "Water boils at",
+      "category": "science",
+      "max_tokens_requested": 3,
+      "tokens_generated": 3,
+      "token_ids": [
+        104264,
+        657,
+        104264
+      ],
+      "first_token_id": 104264,
+      "first_token_text": " boils",
+      "all_tokens_text": " boils at boils",
+      "total_s": 40.391,
+      "tok_s": 0.0743,
+      "first_tok_latency_s": null,
+      "verdict": "coherent"
+    },
+    {
+      "idx": 5,
+      "prompt": "Sky is blue because",
+      "category": "reasoning",
+      "max_tokens_requested": 3,
+      "tokens_generated": 3,
+      "token_ids": [
+        3730,
+        3730,
+        3730
+      ],
+      "first_token_id": 3730,
+      "first_token_text": " blue",
+      "all_tokens_text": " blue blue blue",
+      "total_s": 38.166,
+      "tok_s": 0.0786,
+      "first_tok_latency_s": null,
+      "verdict": "coherent"
+    }
+  ]
+}
